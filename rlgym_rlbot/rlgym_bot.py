@@ -781,8 +781,8 @@ class RLGymBot(Generic[ActionType, ObsType, RewardType]):
                         # OK, we still might be fine if the action we have been taking is the intended one, so let's try to step and then see if what we planned aligns with what we actually did
                         # Pass clear_hist as false because the we are calling _check_last_sent_action_correct_for_ticks_since after calling _env_step
                         self._env_step(
+                            step_packet,
                             step_gs,
-                            step_tick,
                             last_defined_action_tick + 1,
                             clear_hist=False,
                         )
@@ -802,8 +802,8 @@ class RLGymBot(Generic[ActionType, ObsType, RewardType]):
                 else:
                     if next_env_step_tick == cur_tick:
                         self._env_step(
+                            latest_packet,
                             self.latest_game_state,
-                            cur_tick,
                             last_defined_action_tick + 1,
                         )
                     else:
