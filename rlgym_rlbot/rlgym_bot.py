@@ -34,7 +34,6 @@ from rlgym.api import (
 from rlgym_compat import GameState
 from rlgym_compat.sim_extra_info import SimExtraInfo
 
-from .rlgym_state_to_rlbot_state import gamestate_rlgym_to_rlbot
 from .util import create_base_state
 
 AgentID = int
@@ -54,8 +53,8 @@ class MissedStepTickRecoveryStyle(Enum):
 
 @dataclass
 class RLGymBotConfig:
-    action_step_idx_used_to_build_game_state_for_env_step: int = -2
     above_240_fps_mode: bool = False
+    action_step_idx_used_to_build_game_state_for_env_step: int = -2
     missed_action_recovery_style: MissedActionRecoveryStyle = (
         MissedActionRecoveryStyle.RESET
     )
@@ -279,7 +278,7 @@ class RLGymBot(Generic[ActionType, ObsType, RewardType]):
             controller_states = action
         else:
             engine_action = self.action_parser.parse_actions(
-                {self.player_id: action}, self.latest_game_state, self.shared_info
+                {self.player_id: action}, game_state, self.shared_info
             )[self.player_id]
             steps = engine_action.shape[0]
             self._last_engine_action_length = steps
@@ -332,10 +331,14 @@ class RLGymBot(Generic[ActionType, ObsType, RewardType]):
                 car._last_reset_ball_touches_tick = reset_tick
 
     def _env_reset(
-        self, game_state: GameState, start_tick: int, set_state=False
-    ) -> Dict[AgentID, ObsType]:
+        self,
+        packet: flat.GamePacket,
+        game_state: GameState,
+        start_tick: int,
+        set_state=False,
+    ):
 
-        self._last_env_action_start_tick = start_tick
+        self._last_env_action_start_tick = packet.match_info.frame_num
         if self.shared_info_provider is not None:
             self.shared_info = self.shared_info_provider.create(self.shared_info)
         if self.state_mutator is not None:
@@ -360,10 +363,17 @@ class RLGymBot(Generic[ActionType, ObsType, RewardType]):
             self.truncation_condition.reset(agents, game_state, self.shared_info)
         if self.reward_function is not None:
             self.reward_function.reset(agents, game_state, self.shared_info)
-        return self.obs_builder.build_obs(agents, game_state, self.shared_info)
+        obs = self.obs_builder.build_obs(agents, game_state, self.shared_info)
+        self._update_future_tick_action_map(packet, game_state, obs, start_tick)
 
-    def _env_step(self, game_state: GameState, start_tick: int):
-        self._last_env_action_start_tick = start_tick
+    def _env_step(
+        self,
+        packet: flat.GamePacket,
+        game_state: GameState,
+        start_tick: int,
+        clear_hist=True,
+    ) -> Tuple[bool, bool]:
+        self._last_env_action_start_tick = packet.match_info.frame_num
         game_state = deepcopy(game_state)
         self._update_gamestate_ball_touches(game_state.tick_count)
         agents = RLGymBot._get_agents_list(game_state)
@@ -391,7 +401,10 @@ class RLGymBot(Generic[ActionType, ObsType, RewardType]):
                 self.shared_info,
             )
             self.handle_reward(rewards[self.player_id])
-        return obs, is_terminated, is_truncated
+        self._update_future_tick_action_map(
+            packet, game_state, obs, start_tick, clear_hist
+        )
+        return is_terminated, is_truncated
 
     def _handle_packet(self, packet: flat.GamePacket):
         self._unused_packets.append(packet)
@@ -448,7 +461,7 @@ class RLGymBot(Generic[ActionType, ObsType, RewardType]):
             nearest_hist_tick_to_desired_reset_tick
         ]
 
-        self._env_reset_and_update_action_map(
+        self._env_reset_and_maybe_step(
             packet=nearest_packet,
             game_state=nearest_game_state,
             start_tick=desired_submit_first_action_tick,
@@ -460,19 +473,17 @@ class RLGymBot(Generic[ActionType, ObsType, RewardType]):
                 desired_submit_first_action_tick
             ]
 
-    def _env_reset_and_update_action_map(
+    def _env_reset_and_maybe_step(
         self,
         packet: flat.GamePacket,
         game_state: GameState,
         start_tick: bool,
     ):
-        obs = self._env_reset(game_state, start_tick, set_state=False)
-        self._update_future_tick_action_map(packet, game_state, obs, start_tick)
+        self._env_reset(packet, game_state, start_tick, set_state=False)
         if self.config.action_step_idx_used_to_build_game_state_for_env_step == 0:
             # We calculate the update to the obs etc using the same state as the reset and use this to produce the actions to be used after the reset's obs' actions
-            (obs, *_) = self._env_step(game_state, start_tick)
-            self._update_future_tick_action_map(
-                packet, game_state, obs, max(self._future_tick_action_map.keys()) + 1
+            self._env_step(
+                packet, game_state, max(self._future_tick_action_map.keys()) + 1
             )
 
     # Update the future tick action map and internal state based on the unused packets we have collected since the last time this method was called
@@ -562,7 +573,7 @@ class RLGymBot(Generic[ActionType, ObsType, RewardType]):
                     if cur_tick < desired_last_reset_tick:
                         # Update the game state using all the packets sequentially and then reset using the latest packet. Let's just say we plan to start the action this tick so that something is submitted for later
                         self._update_gamestate_using_packets(self._unused_packets)
-                        self._env_reset_and_update_action_map(
+                        self._env_reset_and_maybe_step(
                             packet=latest_packet,
                             game_state=self.latest_game_state,
                             start_tick=cur_tick,
@@ -581,7 +592,7 @@ class RLGymBot(Generic[ActionType, ObsType, RewardType]):
                         self._update_gamestate_using_packets(
                             self._unused_packets[: last_reset_packet_idx + 1]
                         )
-                        self._env_reset_and_update_action_map(
+                        self._env_reset_and_maybe_step(
                             packet=self._unused_packets[last_reset_packet_idx],
                             game_state=self.latest_game_state,
                             start_tick=desired_submit_first_action_tick,
@@ -664,233 +675,7 @@ class RLGymBot(Generic[ActionType, ObsType, RewardType]):
                         (k - countdown_ticks_early): v
                         for (k, v) in self._future_tick_action_map.items()
                     }
-            # We need to update the game state using all the ticks, but we want to grab the correct game state based on the action_step_idx_used_to_build_game_state_for_env_step config value
-            # Let's first look at how this value works in RLGym v2, or more specifically how I would imagine it working if it existed.
-            # For simplicity, let's say every action (by this I mean result from the action parser) has a shape of (4,8) i.e. it defines 4 ticks worth of env actions.
-            # . represents a regular state, and - represents a state transition (due to an env action or a void state),
-            # A value of 0 would look like the below - in particular, the (n+1)th action is decided using the state that the nth action is about to start from:
-            # .-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-
-            # || | | ||| | | ||| | | └Action 3 tick 4, etc
-            # || | | ||| | | ||| | └Action 3 tick 3
-            # || | | ||| | | ||| └Action 3 tick 2
-            # || | | ||| | | ||└Action 3 tick 1
-            # || | | ||| | | |└Obs 4 created using this state, action 4 decided using obs 4
-            # || | | ||| | | └Action 2 tick 4
-            # || | | ||| | └Action 2 tick 3
-            # || | | ||| └Action 2 tick 2
-            # || | | ||└Action 2 tick 1
-            # || | | |└Obs 3 created using this state, action 3 decided using obs 3
-            # || | | └Action 1 tick 4
-            # || | └Action 1 tick 3
-            # || └Action 1 tick 2
-            # |└Action 1 tick 1
-            # └Reset occurs, obs 1 and 2 created using this state, actions 1 and 2 decided using obs 1 and 2 respectively
 
-            # A value of 1 would look like the below - in particular, an action is decided using the state one tick after the last action's env action ticks began:
-            # .-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-
-            # |||| | | ||| | | ||| | └Action 3 tick 4, etc
-            # |||| | | ||| | | ||| └Action 3 tick 3
-            # |||| | | ||| | | ||└Action 3 tick 2
-            # |||| | | ||| | | |└Obs 4 created using this state, action 4 decided using obs 4
-            # |||| | | ||| | | └Action 3 tick 1
-            # |||| | | ||| | └Action 2 tick 4
-            # |||| | | ||| └Action 2 tick 3
-            # |||| | | ||└Action 2 tick 2
-            # |||| | | |└Obs 3 created using this state, action 3 decided using obs 3
-            # |||| | | └Action 2 tick 1
-            # |||| | └Action 1 tick 4
-            # |||| └Action 1 tick 3
-            # |||└Action 1 tick 2
-            # ||└Obs 2 created using this state, action 2 decided using obs 2
-            # |└Action 1 tick 1
-            # └Reset occurs, obs 1 created using this state, action 1 decided using obs 1
-
-            # A value of -1 would look like the below - in particular, the next action action is decided using the state after the last action's env action ticks are done:
-            # .-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-
-            # || | | ||| | ||| | | ||└Action 3 tick 4, etc
-            # || | | ||| | ||| | | |└Obs 4 created using this state, action 4 decided using obs 4
-            # || | | ||| | ||| | | └Action 3 tick 3
-            # || | | ||| | ||| | └Action 3 tick 2
-            # || | | ||| | ||| └Action 3 tick 1
-            # || | | ||| | ||└Action 2 tick 4
-            # || | | ||| | |└Obs 3 created using this state, action 3 decided using obs 3
-            # || | | ||| | └Action 2 tick 3
-            # || | | ||| └Action 2 tick 2
-            # || | | ||└Action 2 tick 1
-            # || | | |└Obs 2 created using this state, action 2 decided using obs 2
-            # || | | └Action 1 tick 4
-            # || | └Action 1 tick 3
-            # || └Action 1 tick 2
-            # |└Action 1 tick 1
-            # └Reset occurs, obs 1 created using this state, action 1 decided using obs 1
-
-            # A value of -2 would look like the below - in particular, an action is decided using the state one tick before the last action's env action ticks are done:
-            # .-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-
-            # || | | ||| | | ||| | | ||└Action 3 tick 4, etc
-            # || | | ||| | | ||| | | |└Obs 4 created using this state, action 4 decided using obs 4
-            # || | | ||| | | ||| | | └Action 3 tick 3
-            # || | | ||| | | ||| | └Action 3 tick 2
-            # || | | ||| | | ||| └Action 3 tick 1
-            # || | | ||| | | ||└Action 2 tick 4
-            # || | | ||| | | |└Obs 3 created using this state, action 3 decided using obs 3
-            # || | | ||| | | └Action 2 tick 3
-            # || | | ||| | └Action 2 tick 2
-            # || | | ||| └Action 2 tick 1
-            # || | | ||└Action 1 tick 4
-            # || | | |└Obs 2 created using this state, action 2 decided using obs 2
-            # || | | └Action 1 tick 3
-            # || | └Action 1 tick 2
-            # || └Action 1 tick 1
-            # |└"void" state transition where sim is stepped without any cars' controls being set
-            # └Reset occurs, obs 1 created using this state, action 1 decided using obs 1
-
-            # -----------------------------------------------------------------------------------------------------------------------------------------------------------------
-            # Let's investigate how we can match this in RLBot. Matching the -1 case is impossible when running Rocket League at 120fps, but is possible at higher frame rates.
-            # We will account for that separately - let's focus on the other cases for now.
-            # When running at 120fps, submitting an action when the latest packet is for tick n will mean that action gets used in the tick (n+1) to tick (n+2) transition.
-            # We will introduce an additional symbol - c will indicate a countdown state. We will need this because we will want to start before the first tick of kickoff.
-            # In particular, the last countdown state is followed by a state transition that actually uses whatever actions have been input.
-            # For values above -1, we cannot match RLGym exactly for the reset state because that would require taking an action for a state immediately following seeing that state, which is not possible at 120fps.
-            # Instead, we will use the last tick of the countdown. Previously I have written "Action n tick k" but now I will explicitly write that this is the state transition where that
-            # gets used, not where it is submitted, because in RLBot that distinction matters. This one is going to look quite cluttered, but it is easiest to do it this way to line it up with the
-            # diagrams above. Later we will simplify this down by removing the lines where env actions get used, since only the submitted ones matter for our logic.
-
-            # How can we match the 0 case? In RLGym, the reset state is the state directly preceding the tick that action 1 tick 1 is used. However, we can't generate the obs for this
-            # and submit it at the correct time, so we use the state during the countdown before the proper reset state as a stand-in since the cars aren't taking any actions anyway (they are just settling)
-            # c-c-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-
-            # | |||||||||||||||||||||||└Action 3 tick 4 used, etc
-            # | ||||||||||||||||||||||└Action 4 tick 1 submitted
-            # | |||||||||||||||||||||└Action 3 tick 3 used
-            # | ||||||||||||||||||||└Action 3 tick 4 submitted
-            # | |||||||||||||||||||└Action 3 tick 2 used
-            # | ||||||||||||||||||└Action 3 tick 3 submitted
-            # | |||||||||||||||||└Action 3 tick 1 used
-            # | ||||||||||||||||└Obs 4 created using this state, action 4 decided using obs 4, action 3 tick 2 submitted
-            # | |||||||||||||||└Action 2 tick 4 used
-            # | ||||||||||||||└Action 3 tick 1 submitted
-            # | |||||||||||||└Action 2 tick 3 used
-            # | ||||||||||||└Action 2 tick 4 submitted
-            # | |||||||||||└Action 2 tick 2 used
-            # | ||||||||||└Action 2 tick 3 submitted
-            # | |||||||||└Action 2 tick 1 used
-            # | ||||||||└Obs 3 created using this state, action 3 decided using obs 3, action 2 tick 2 submitted
-            # | |||||||└Action 1 tick 4 used
-            # | ||||||└Action 2 tick 1 submitted
-            # | |||||└Action 1 tick 3 used
-            # | ||||└Action 1 tick 4 submitted
-            # | |||└Action 1 tick 2 used
-            # | ||└Action 1 tick 3 submitted
-            # | |└Action 1 tick 1 used
-            # | └Action 1 tick 2 submitted
-            # └Obs 1 and 2 created using this state, actions 1 and 2 decided using obs 1 and 2 respectively. Action 1 tick 1 submitted
-
-            # Now for the 1 case. Same issue as above.
-            # c-c-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-
-            # | |||||||||||||||||||||||└Action 3 tick 4 used, etc
-            # | ||||||||||||||||||||||└Action 4 tick 1 submitted
-            # | |||||||||||||||||||||└Action 3 tick 3 used
-            # | ||||||||||||||||||||└Action 3 tick 4 submitted
-            # | |||||||||||||||||||└Action 3 tick 2 used
-            # | ||||||||||||||||||└Obs 4 created using this state, action 4 decided using obs 4, action 3 tick 3 submitted
-            # | |||||||||||||||||└Action 3 tick 1 used
-            # | ||||||||||||||||└Action 3 tick 2 submitted
-            # | |||||||||||||||└Action 2 tick 4 used
-            # | ||||||||||||||└Action 3 tick 1 submitted
-            # | |||||||||||||└Action 2 tick 3 used
-            # | ||||||||||||└Action 2 tick 4 submitted
-            # | |||||||||||└Action 2 tick 2 used
-            # | ||||||||||└Obs 3 created using this state, action 3 decided using obs 3, action 2 tick 3 submitted
-            # | |||||||||└Action 2 tick 1 used
-            # | ||||||||└Action 2 tick 2 submitted
-            # | |||||||└Action 1 tick 4 used
-            # | ||||||└Action 2 tick 1 submitted
-            # | |||||└Action 1 tick 3 used
-            # | ||||└Action 1 tick 4 submitted
-            # | |||└Action 1 tick 2 used
-            # | ||└Obs 2 created using this state, action 2 decided using obs 2, action 1 tick 3 submitted
-            # | |└Action 1 tick 1 used
-            # | └Action 1 tick 2 submitted
-            # └Obs 1 created using this state, action 1 decided using obs 1. Action 1 tick 1 submitted
-
-            # Now for the -2 case. Here the void state transition actually works in our favor. We do the same thing as in the previous cases using the countdown state
-            # before the last countdown state to determine the action, but here the void state transition is equivalent to waiting one tick anyway, so this is tick perfect.
-            # c-c-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-
-            # | |||||||||||||||||||||||└Action 3 tick 4 used, etc
-            # | ||||||||||||||||||||||└Obs 4 created using this state, action 4 decided using obs 4, action 4 tick 1 submitted
-            # | |||||||||||||||||||||└Action 3 tick 3 used
-            # | ||||||||||||||||||||└Action 3 tick 4 submitted
-            # | |||||||||||||||||||└Action 3 tick 2 used
-            # | ||||||||||||||||||└Action 3 tick 3 submitted
-            # | |||||||||||||||||└Action 3 tick 1 used
-            # | ||||||||||||||||└Action 3 tick 2 submitted
-            # | |||||||||||||||└Action 2 tick 4 used
-            # | ||||||||||||||└Obs 3 created using this state, action 3 decided using obs 3, action 3 tick 1 submitted
-            # | |||||||||||||└Action 2 tick 3 used
-            # | ||||||||||||└Action 2 tick 4 submitted
-            # | |||||||||||└Action 2 tick 2 used
-            # | ||||||||||└Action 2 tick 3 submitted
-            # | |||||||||└Action 2 tick 1 used
-            # | ||||||||└Action 2 tick 2 submitted
-            # | |||||||└Action 1 tick 4 used
-            # | ||||||└Obs 2 created using this state, action 2 decided using obs 2, action 2 tick 1 submitted
-            # | |||||└Action 1 tick 3 used
-            # | ||||└Action 1 tick 4 submitted
-            # | |||└Action 1 tick 2 used
-            # | ||└Action 1 tick 3 submitted
-            # | |└Action 1 tick 1 used
-            # | └Action 1 tick 2 submitted
-            # └Obs 1 created using this state, action 1 decided using obs 1. Action 1 tick 1 submitted
-
-            # As promised, let's de-clutter by removing all the "action n tick k used" lines.
-            # 0 case:
-            # c-c-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-
-            # | | | | | | | | | | | | └Action 4 tick 1 submitted, etc
-            # | | | | | | | | | | | └Action 3 tick 4 submitted
-            # | | | | | | | | | | └Action 3 tick 3 submitted
-            # | | | | | | | | | └Obs 4 created using this state, action 4 decided using obs 4, action 3 tick 2 submitted
-            # | | | | | | | | └Action 3 tick 1 submitted
-            # | | | | | | | └Action 2 tick 4 submitted
-            # | | | | | | └Action 2 tick 3 submitted
-            # | | | | | └Obs 3 created using this state, action 3 decided using obs 3, action 2 tick 2 submitted
-            # | | | | └Action 2 tick 1 submitted
-            # | | | └Action 1 tick 4 submitted
-            # | | └Action 1 tick 3 submitted
-            # | └Action 1 tick 2 submitted
-            # └Obs 1 and 2 created using this state, actions 1 and 2 decided using obs 1 and 2 respectively. Action 1 tick 1 submitted
-
-            # 1 case:
-            # c-c-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-
-            # | | | | | | | | | | | | └Action 4 tick 1 submitted, etc
-            # | | | | | | | | | | | └Action 3 tick 4 submitted
-            # | | | | | | | | | | └Obs 4 created using this state, action 4 decided using obs 4, action 3 tick 3 submitted
-            # | | | | | | | | | └Action 3 tick 2 submitted
-            # | | | | | | | | └Action 3 tick 1 submitted
-            # | | | | | | | └Action 2 tick 4 submitted
-            # | | | | | | └Obs 3 created using this state, action 3 decided using obs 3, action 2 tick 3 submitted
-            # | | | | | └Action 2 tick 2 submitted
-            # | | | | └Action 2 tick 1 submitted
-            # | | | └Action 1 tick 4 submitted
-            # | | └Obs 2 created using this state, action 2 decided using obs 2, action 1 tick 3 submitted
-            # | └Action 1 tick 2 submitted
-            # └Obs 1 created using this state, action 1 decided using obs 1. Action 1 tick 1 submitted
-
-            # -2 case:
-            # c-c-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-
-            # | | | | | | | | | | | | └Obs 4 created using this state, action 4 decided using obs 4, action 4 tick 1 submitted, etc
-            # | | | | | | | | | | | └Action 3 tick 4 submitted
-            # | | | | | | | | | | └Action 3 tick 3 submitted
-            # | | | | | | | | | └Action 3 tick 2 submitted
-            # | | | | | | | | └Obs 3 created using this state, action 3 decided using obs 3, action 3 tick 1 submitted
-            # | | | | | | | └Action 2 tick 4 submitted
-            # | | | | | | └Action 2 tick 3 submitted
-            # | | | | | └Action 2 tick 2 submitted
-            # | | | | └Obs 2 created using this state, action 2 decided using obs 2, action 2 tick 1 submitted
-            # | | | └Action 1 tick 4 submitted
-            # | | └Action 1 tick 3 submitted
-            # | └Action 1 tick 2 submitted
-            # └Obs 1 created using this state, action 1 decided using obs 1. Action 1 tick 1 submitted
-
-            # Let's rewrite this in terms of the number of ticks backwards you have to look based on the length of the previously decided action.
             # Let's say the last action we took defined controller inputs for n ticks, and self._future_tick_action_map defines actions for k more ticks (i.e. k = max(self._future_tick_action_map) - cur_tick).
             # Let's look at when the previous action was created, at tick cur_tick'. We have some k' which is the value of k at the time when the previous action was created. When this happens, the next action
             # will start at cur_tick'+k'+1. After the action gets added, max(self._future_tick_action_map) = cur_tick'+k'+n and so k = cur_tick'+k'+n-cur_tick so k+cur_tick-n+1 = cur_tick'+k'+1.
@@ -987,22 +772,18 @@ class RLGymBot(Generic[ActionType, ObsType, RewardType]):
                     # Next see if we are still fine and handle the various scenarios
                     if last_defined_action_tick >= cur_tick:
                         # OK, we can still catch up
-                        (obs, *_) = self._env_step(step_gs, step_tick)
-                        self._update_future_tick_action_map(
+                        self._env_step(
                             step_packet,
                             step_gs,
-                            obs,
-                            max(self._future_tick_action_map.keys()) + 1,
+                            last_defined_action_tick + 1,
                         )
                     else:
                         # OK, we still might be fine if the action we have been taking is the intended one, so let's try to step and then see if what we planned aligns with what we actually did
-                        (obs, *_) = self._env_step(step_gs, step_tick)
                         # Pass clear_hist as false because the we are calling _check_last_sent_action_correct_for_ticks_since after calling _env_step
-                        self._update_future_tick_action_map(
-                            step_packet,
+                        self._env_step(
                             step_gs,
-                            obs,
-                            max(self._future_tick_action_map.keys()) + 1,
+                            step_tick,
+                            last_defined_action_tick + 1,
                             clear_hist=False,
                         )
                         if not self._check_last_sent_action_correct_for_ticks_since():
@@ -1020,12 +801,10 @@ class RLGymBot(Generic[ActionType, ObsType, RewardType]):
                                     pass
                 else:
                     if next_env_step_tick == cur_tick:
-                        (obs, *_) = self._env_step(self.latest_game_state, cur_tick)
-                        self._update_future_tick_action_map(
-                            latest_packet,
+                        self._env_step(
                             self.latest_game_state,
-                            obs,
-                            max(self._future_tick_action_map.keys()) + 1,
+                            cur_tick,
+                            last_defined_action_tick + 1,
                         )
                     else:
                         should_continue = False
@@ -1043,10 +822,8 @@ class RLGymBot(Generic[ActionType, ObsType, RewardType]):
         block_next = False
 
         while running:
-            # If there might be more messages,
-            # check for another one with blocking=False
-            # if there are no more messages, process the latest packet
-            # then wait for the next message with blocking=True
+            # If there might be more messages, check for another one with blocking=False
+            # if there are no more messages, process the latest packet then wait for the next message with blocking=True
             result = self._game_interface.handle_incoming_messages(blocking=block_next)
             block_next = False
             match result:

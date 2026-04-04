@@ -1,16 +1,14 @@
-import numpy as np
 from rlbot.flat import (
     DesiredBallState,
     DesiredCarState,
     DesiredGameState,
     DesiredMatchInfo,
     DesiredPhysics,
-    FieldInfo,
     GamePacket,
     RotatorPartial,
     Vector3Partial,
 )
-from rlgym_compat import Car, GameConfig, GameState, PhysicsObject
+from rlgym_compat import Car, GameState, PhysicsObject
 
 
 def physics_rlgym_to_rlbot(physics: PhysicsObject) -> DesiredPhysics:
