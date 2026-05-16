@@ -21,7 +21,7 @@ dependencies = [
     "rlbot == 2.0.0b52",
     "rlbot_flatbuffers >= 0.18.8",
     "rlgym[api] >= 2.0.1",
-    "rlgym-compat @ git+https://github.com/JPK314/rlgym-compat.git@50b70c8"
+    "rlgym-compat >= 2.0.0"
 ]
 keywords=[
     "rocket-league",
