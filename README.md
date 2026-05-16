@@ -26,7 +26,7 @@ class MyBot(RLGymBot):
 if __name__ == "__main__":
     MyBot().run()
 ```
-In the above example, I am using a custom obs builder (implementation not shown) and a standard action parser using imports from the RLGym[rl] Python package. Where you put your configuration objects' implementations so that they can be used in the above snippet is up to you. The other missing piece is the implementation of the Actor - this is the piece that takes something of type ObsType and converts it to something of type ActionType. Typically this is something defined in your learning framework of choice that converts a batch of ObsType to a Torch tensor, runs it through your model, and then converts the result to a batch of ActionType. You will need to know what you're using and how to rip it out of the learning framework you're using to use it here instead.
+In the above example, I am using a custom obs builder (implementation not shown) and a standard action parser using imports from the RLGym[rl] Python package. Where you put your configuration objects' implementations so that they can be used in the above snippet is up to you. The other missing definition is the Agent class - this is an abstraction you might have in your learning framework that takes something of type ObsType and converts it to something of type ActionType. Typically this is something that converts a batch of ObsType to a Torch tensor, runs it through your model, and then converts the result to a batch of ActionType. You will need to know what you're using and how to rip it out of the learning framework you're using to use it here instead.
 
 The `RLGymBotConfig` class contains a couple useful knobs which are described in the following section.
 
